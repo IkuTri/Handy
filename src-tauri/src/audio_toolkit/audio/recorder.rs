@@ -63,21 +63,24 @@ impl AudioRecorder {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
 
         let host = crate::audio_toolkit::get_cpal_host();
-        let device = match device {
-            Some(dev) => dev,
-            None => host
-                .default_input_device()
-                .ok_or_else(|| Error::new(std::io::ErrorKind::NotFound, "No input device found"))?,
+
+        // Find a device with a valid config - try specified device first, then default, then others
+        let (device, config) = match device {
+            Some(dev) => {
+                let cfg = Self::get_preferred_config(&dev)?;
+                (dev, cfg)
+            }
+            None => Self::find_working_device(&host)?,
         };
 
         let thread_device = device.clone();
+        let thread_config = config;
         let vad = self.vad.clone();
         // Move the optional level callback into the worker thread
         let level_cb = self.level_cb.clone();
 
         let worker = std::thread::spawn(move || {
-            let config = AudioRecorder::get_preferred_config(&thread_device)
-                .expect("failed to fetch preferred config");
+            let config = thread_config;
 
             let sample_rate = config.sample_rate().0;
             let channels = config.channels() as usize;
@@ -198,6 +201,43 @@ impl AudioRecorder {
             |err| log::error!("Stream error: {}", err),
             None,
         )
+    }
+
+    /// Find a working input device with a valid config.
+    /// Tries default device first, then falls back to other available devices.
+    fn find_working_device(
+        host: &cpal::Host,
+    ) -> Result<(Device, cpal::SupportedStreamConfig), Box<dyn std::error::Error>> {
+
+        // Try default device first
+        if let Some(default_dev) = host.default_input_device() {
+            if let Ok(config) = Self::get_preferred_config(&default_dev) {
+                log::info!("Using default input device: {:?}", default_dev.name());
+                return Ok((default_dev, config));
+            }
+            log::warn!(
+                "Default input device {:?} failed to provide valid config, trying alternatives...",
+                default_dev.name()
+            );
+        }
+
+        // Try other available input devices
+        if let Ok(devices) = host.input_devices() {
+            for device in devices {
+                if let Ok(config) = Self::get_preferred_config(&device) {
+                    log::info!(
+                        "Using fallback input device: {:?}",
+                        device.name().unwrap_or_else(|_| "Unknown".into())
+                    );
+                    return Ok((device, config));
+                }
+            }
+        }
+
+        Err(Box::new(Error::new(
+            std::io::ErrorKind::NotFound,
+            "No compatible input device found. All devices failed to provide valid audio configuration.",
+        )))
     }
 
     fn get_preferred_config(
